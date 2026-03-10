@@ -14,3 +14,5 @@ Offroad_Segmentation_Training_Dataset
 
 segmentation_head.pth
 predictions
+segmentation_head.pth
+feature_cache
