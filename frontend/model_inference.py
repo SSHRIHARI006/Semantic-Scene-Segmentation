@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import cv2
@@ -77,7 +78,9 @@ class SegmentationHead(nn.Module):
 class TerrainSegmentationModel:
     """Main model class for terrain segmentation"""
     
-    def __init__(self, model_path="../segmentation_head.pth"):
+    def __init__(self, model_path=None):
+        if model_path is None:
+            model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "segmentation_head.pth")
         self.device = device
         self.model_path = model_path
         self.backbone = None
@@ -118,7 +121,7 @@ class TerrainSegmentationModel:
             W // 14
         ).to(self.device)
         
-        self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        self.model.load_state_dict(torch.load(self.model_path, map_location=self.device, weights_only=True))
         self.model.eval()
         
         print("Models loaded successfully!")

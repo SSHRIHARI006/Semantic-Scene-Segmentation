@@ -1,215 +1,214 @@
-import cv2
-import numpy as np
+"""
+path_planner.py — A* navigator on a segmentation-derived cost grid.
+
+Public API:
+  plan_path(seg_map) -> dict with keys:
+    "path"       : list of (row, col) in full-image coords, or []
+    "grid"       : downsampled binary obstacle grid (for debug)
+    "scale"      : downsample factor applied
+    "start"      : (row, col) start in full-image coords
+    "goal"       : (row, col) goal  in full-image coords
+    "found"      : bool
+"""
+
 import heapq
-from typing import List, Tuple, Optional
+import numpy as np
+import cv2
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Downsample factor — A* runs on this smaller grid (much faster)
+GRID_SCALE = 6
+
+# Cost per grid cell type (from segmentation.py TRAVERSAL_COST)
+# 0=clear, 1=costly, 2=hard obstacle
+MOVE_COST  = {0: 1.0, 1: 4.0, 2: float("inf")}
+
+# 8-directional movement (dr, dc, base_cost_multiplier)
+_DIRS = [
+    (-1,  0, 1.0), ( 1,  0, 1.0), ( 0, -1, 1.0), ( 0,  1, 1.0),
+    (-1, -1, 1.414), (-1,  1, 1.414), ( 1, -1, 1.414), ( 1,  1, 1.414),
+]
+
+
+def _build_grid(seg_map: np.ndarray, scale: int) -> np.ndarray:
+    """Downsample and convert cost map to obstacle grid."""
+    h, w  = seg_map.shape
+    sh, sw = h // scale, w // scale
+
+    # Import cost mapping from segmentation module
+    from segmentation import TRAVERSAL_COST
+    cost_map = np.full(seg_map.shape, 2, dtype=np.uint8)
+    for cls, cost in TRAVERSAL_COST.items():
+        cost_map[seg_map == cls] = cost
+
+    # Downsample taking the max (worst-case obstacle wins)
+    small = cv2.resize(cost_map, (sw, sh), interpolation=cv2.INTER_NEAREST)
+    return small
+
+
+def _heuristic(a, b):
+    # Octile distance (matches 8-directional movement)
+    dr = abs(a[0] - b[0])
+    dc = abs(a[1] - b[1])
+    return max(dr, dc) + (1.414 - 1.0) * min(dr, dc)
+
+
+def _astar(grid: np.ndarray, start: tuple, goal: tuple):
+    """
+    A* on a cost grid. Cells with cost==inf are impassable.
+    Returns list of (r, c) from start to goal, or [].
+    """
+    rows, cols = grid.shape
+
+    def cell_cost(r, c):
+        v = int(grid[r, c])
+        return MOVE_COST.get(v, float("inf"))
+
+    # If goal is an obstacle, relax it to nearest clear cell
+    if cell_cost(*goal) == float("inf"):
+        best_dist, best_cell = float("inf"), goal
+        for r in range(rows):
+            for c in range(cols):
+                if cell_cost(r, c) < float("inf"):
+                    d = abs(r - goal[0]) + abs(c - goal[1])
+                    if d < best_dist:
+                        best_dist, best_cell = d, (r, c)
+        goal = best_cell
+
+    open_set  = []
+    heapq.heappush(open_set, (0.0, start))
+    came_from = {}
+    g_score   = {start: 0.0}
+
+    while open_set:
+        _, cur = heapq.heappop(open_set)
+
+        if cur == goal:
+            path = []
+            while cur in came_from:
+                path.append(cur)
+                cur = came_from[cur]
+            path.append(start)
+            return path[::-1]
+
+        r, c = cur
+        for dr, dc, base_mul in _DIRS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                continue
+            cc = cell_cost(nr, nc)
+            if cc == float("inf"):
+                continue
+            tentative_g = g_score[cur] + base_mul * cc
+            nb = (nr, nc)
+            if tentative_g < g_score.get(nb, float("inf")):
+                came_from[nb] = cur
+                g_score[nb]   = tentative_g
+                f               = tentative_g + _heuristic(nb, goal)
+                heapq.heappush(open_set, (f, nb))
+
+    return []   # no path found
+
+
+def plan_path(seg_map: np.ndarray) -> dict:
+    """
+    Full pipeline: seg_map -> obstacle grid -> A* -> full-res path.
+
+    Start : bottom-centre of image
+    Goal  : top-centre of image (top 5% row)
+    """
+    scale = GRID_SCALE
+    grid  = _build_grid(seg_map, scale)
+    gh, gw = grid.shape
+
+    # Grid-space start / goal
+    g_start = (gh - 1,      gw // 2)
+    g_goal  = (gh // 20,    gw // 2)   # top ~5 %
+
+    raw_path = _astar(grid, g_start, g_goal)
+
+    # Upscale back to full-image coordinates (centre of each cell)
+    full_path = [
+        (r * scale + scale // 2, c * scale + scale // 2)
+        for r, c in raw_path
+    ]
+
+    # Full-image start/goal
+    full_start = (g_start[0] * scale + scale // 2,
+                  g_start[1] * scale + scale // 2)
+    full_goal  = (g_goal[0]  * scale + scale // 2,
+                  g_goal[1]  * scale + scale // 2)
+
+    return {
+        "path"  : full_path,
+        "grid"  : grid,
+        "scale" : scale,
+        "start" : full_start,
+        "goal"  : full_goal,
+        "found" : len(full_path) > 0,
+    }
+
+
+# ── Compatibility API used by app.py and test_integration.py ─────────
+
+def compute_path(image, obstacle_grid, start_pos, goal_pos):
+    """
+    Compatibility wrapper used by the Streamlit app.
+
+    Args:
+        image        : BGR image (H, W, 3) — used only to draw path on
+        obstacle_grid: binary array (H, W), 0=navigable 1=obstacle
+        start_pos    : (x, y) pixel coord in image space
+        goal_pos     : (x, y) pixel coord in image space
+
+    Returns:
+        path_image : BGR image with path drawn on it
+        path       : list of (x, y) points, or None if no path found
+    """
+    import cv2 as _cv2
+
+    h, w = obstacle_grid.shape
+
+    # Build our cost grid from binary obstacle grid
+    # 0 = clear (navigable), 2 = hard obstacle
+    cost_grid = (obstacle_grid * 2).astype(np.uint8)
+
+    # Convert (x, y) start/goal to (row, col)
+    s_col, s_row = int(start_pos[0]), int(start_pos[1])
+    g_col, g_row = int(goal_pos[0]),  int(goal_pos[1])
+    s_row = max(0, min(s_row, h - 1))
+    s_col = max(0, min(s_col, w - 1))
+    g_row = max(0, min(g_row, h - 1))
+    g_col = max(0, min(g_col, w - 1))
+
+    raw_path = _astar(cost_grid, (s_row, s_col), (g_row, g_col))
+
+    path_image = image.copy()
+
+    if not raw_path:
+        _cv2.putText(path_image, "NO PATH FOUND", (w // 4, h // 2),
+                     _cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        return path_image, None
+
+    # raw_path is (row, col) → convert back to (x, y) for drawing
+    xy_path = [(c, r) for r, c in raw_path]
+
+    pts = np.array(xy_path, dtype=np.int32)
+    _cv2.polylines(path_image, [pts.reshape(-1, 1, 2)], False,
+                   (0, 255, 0), thickness=3, lineType=_cv2.LINE_AA)
+
+    # Start / goal markers
+    _cv2.circle(path_image, (s_col, s_row), 10, (200, 80,  0 ), -1)
+    _cv2.circle(path_image, (g_col, g_row), 10, (0,   200, 200), -1)
+
+    return path_image, xy_path
 
 
 class AStarPathPlanner:
-    """A* path planning algorithm for grid-based navigation"""
-    
-    def __init__(self, obstacle_grid):
-        """
-        Initialize path planner
-        
-        Args:
-            obstacle_grid: Binary grid where 1=obstacle, 0=navigable
-        """
-        self.grid = obstacle_grid
-        self.height, self.width = obstacle_grid.shape
-    
-    def heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
-        """Euclidean distance heuristic"""
-        return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
-    
-    def get_neighbors(self, pos: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """Get valid neighboring cells (8-connected)"""
-        x, y = pos
-        neighbors = []
-        
-        # 8-connected grid (includes diagonals)
-        directions = [
-            (-1, -1), (-1, 0), (-1, 1),
-            (0, -1),           (0, 1),
-            (1, -1),  (1, 0),  (1, 1)
-        ]
-        
-        for dx, dy in directions:
-            nx, ny = x + dx, y + dy
-            
-            # Check bounds
-            if 0 <= nx < self.height and 0 <= ny < self.width:
-                # Check if navigable
-                if self.grid[nx, ny] == 0:
-                    neighbors.append((nx, ny))
-        
-        return neighbors
-    
-    def find_path(self, start: Tuple[int, int], goal: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
-        """
-        Find shortest path using A* algorithm
-        
-        Args:
-            start: Starting position (row, col)
-            goal: Goal position (row, col)
-            
-        Returns:
-            List of positions forming the path, or None if no path exists
-        """
-        # Ensure start and goal are valid
-        if not (0 <= start[0] < self.height and 0 <= start[1] < self.width):
-            return None
-        if not (0 <= goal[0] < self.height and 0 <= goal[1] < self.width):
-            return None
-        
-        # If start or goal is an obstacle, try to find nearest navigable cell
-        if self.grid[start[0], start[1]] == 1:
-            start = self._find_nearest_navigable(start)
-            if start is None:
-                return None
-        
-        if self.grid[goal[0], goal[1]] == 1:
-            goal = self._find_nearest_navigable(goal)
-            if goal is None:
-                return None
-        
-        # Priority queue: (f_score, counter, position)
-        counter = 0
-        open_set = [(0, counter, start)]
-        counter += 1
-        
-        # Track visited nodes
-        came_from = {}
-        
-        # Cost from start to node
-        g_score = {start: 0}
-        
-        # Estimated total cost
-        f_score = {start: self.heuristic(start, goal)}
-        
-        # Set of visited nodes
-        closed_set = set()
-        
-        while open_set:
-            current_f, _, current = heapq.heappop(open_set)
-            
-            # Goal reached
-            if current == goal:
-                return self._reconstruct_path(came_from, current)
-            
-            if current in closed_set:
-                continue
-            
-            closed_set.add(current)
-            
-            # Check neighbors
-            for neighbor in self.get_neighbors(current):
-                if neighbor in closed_set:
-                    continue
-                
-                # Calculate tentative g_score
-                # Diagonal movement costs sqrt(2), orthogonal costs 1
-                dx = abs(neighbor[0] - current[0])
-                dy = abs(neighbor[1] - current[1])
-                move_cost = 1.414 if (dx + dy) == 2 else 1.0
-                
-                tentative_g = g_score[current] + move_cost
-                
-                if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                    # This path is better
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g
-                    f_score[neighbor] = tentative_g + self.heuristic(neighbor, goal)
-                    
-                    heapq.heappush(open_set, (f_score[neighbor], counter, neighbor))
-                    counter += 1
-        
-        # No path found
-        return None
-    
-    def _reconstruct_path(self, came_from: dict, current: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """Reconstruct path from goal to start"""
-        path = [current]
-        while current in came_from:
-            current = came_from[current]
-            path.append(current)
-        path.reverse()
-        return path
-    
-    def _find_nearest_navigable(self, pos: Tuple[int, int], max_distance: int = 50) -> Optional[Tuple[int, int]]:
-        """Find nearest navigable cell within max_distance"""
-        x, y = pos
-        
-        for distance in range(1, max_distance):
-            for dx in range(-distance, distance + 1):
-                for dy in range(-distance, distance + 1):
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < self.height and 0 <= ny < self.width:
-                        if self.grid[nx, ny] == 0:
-                            return (nx, ny)
-        
-        return None
+    """Class wrapper around compute_path for use in app.py."""
 
-
-def compute_path(image, obstacle_grid, start_pos=None, goal_pos=None):
-    """
-    Compute optimal path and overlay on image
-    
-    Args:
-        image: Original BGR image
-        obstacle_grid: Binary obstacle map (1=obstacle, 0=navigable)
-        start_pos: Optional start position (col, row). Default: bottom center
-        goal_pos: Optional goal position (col, row). Default: top center
-        
-    Returns:
-        path_image: Image with path overlay
-        path: List of path coordinates
-    """
-    height, width = image.shape[:2]
-    
-    # Default start and goal
-    if start_pos is None:
-        start_pos = (width // 2, height - 20)
-    if goal_pos is None:
-        goal_pos = (width // 2, 20)
-    
-    # Convert from (col, row) to (row, col) for grid indexing
-    start = (start_pos[1], start_pos[0])
-    goal = (goal_pos[1], goal_pos[0])
-    
-    # Initialize path planner
-    planner = AStarPathPlanner(obstacle_grid)
-    
-    # Find path
-    path = planner.find_path(start, goal)
-    
-    # Create visualization
-    path_image = image.copy()
-    
-    if path is not None and len(path) > 1:
-        # Draw path
-        path_points = [(p[1], p[0]) for p in path]  # Convert back to (col, row)
-        
-        # Draw path line
-        for i in range(len(path_points) - 1):
-            cv2.line(path_image, path_points[i], path_points[i + 1], (0, 255, 0), 4)
-        
-        # Draw start marker
-        cv2.circle(path_image, start_pos, 10, (255, 0, 0), -1)  # Blue circle
-        cv2.putText(path_image, "START", (start_pos[0] - 30, start_pos[1] + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Draw goal marker
-        cv2.circle(path_image, goal_pos, 10, (0, 0, 255), -1)  # Red circle
-        cv2.putText(path_image, "GOAL", (goal_pos[0] - 25, goal_pos[1] - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Add path length info
-        path_length = len(path)
-        cv2.putText(path_image, f"Path Length: {path_length} pixels",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    else:
-        # No path found
-        cv2.putText(path_image, "NO PATH FOUND", (width // 2 - 100, height // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
-    
-    return path_image, path
+    def plan(self, image, obstacle_grid, start_pos, goal_pos):
+        return compute_path(image, obstacle_grid, start_pos, goal_pos)

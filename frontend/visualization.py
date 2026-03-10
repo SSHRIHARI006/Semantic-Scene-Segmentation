@@ -1,340 +1,193 @@
+"""
+visualization.py — Image overlay utilities.
+"""
+
 import cv2
 import numpy as np
+import sys
+import os
+
+# Ensure segmentation.py (in the same directory) is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from segmentation import PALETTE, CLASS_NAMES, NUM_CLASSES
+except ImportError:
+    # Fallback palette if segmentation module not available
+    NUM_CLASSES = 10
+    CLASS_NAMES = ["Background","Trees","Bushes","Dry Grass","Rocks",
+                   "Logs","Terrain","Sky","Landscape","Other"]
+    PALETTE = np.array([
+        [20,20,20],[34,139,34],[0,200,80],[210,180,140],[112,112,112],
+        [101,67,33],[160,100,40],[135,206,235],[128,128,0],[148,0,211]
+    ], dtype=np.uint8)
 
 
-def overlay_segmentation(image, segmentation, alpha=0.5):
-    """
-    Overlay segmentation map on original image
-    
-    Args:
-        image: Original BGR image
-        segmentation: RGB segmentation mask
-        alpha: Transparency factor (0-1). Higher = more segmentation visible
-        
-    Returns:
-        Blended overlay image
-    """
-    # Ensure same dimensions
-    if image.shape[:2] != segmentation.shape[:2]:
-        segmentation = cv2.resize(segmentation, (image.shape[1], image.shape[0]))
-    
-    # Blend images
-    overlay = cv2.addWeighted(image, 1 - alpha, segmentation, alpha, 0)
-    
-    return overlay
+def colorize_segmentation(seg_map: np.ndarray) -> np.ndarray:
+    """(H,W) class IDs -> (H,W,3) BGR image for display."""
+    rgb = PALETTE[seg_map.ravel()].reshape(seg_map.shape[0], seg_map.shape[1], 3)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
-def create_side_by_side(images, labels=None, border_width=2):
+def overlay_path(orig_bgr: np.ndarray,
+                 seg_map: np.ndarray,
+                 plan: dict,
+                 seg_alpha: float = 0.45) -> np.ndarray:
     """
-    Create side-by-side visualization of multiple images
-    
-    Args:
-        images: List of images (BGR format)
-        labels: Optional list of labels for each image
-        border_width: Width of border between images
-        
-    Returns:
-        Combined image
+    Blend segmentation over the original image, then draw:
+      - Obstacle pixels in semi-transparent red
+      - A* path as a thick green polyline with waypoint dots
+      - Start marker (blue circle) and Goal marker (yellow star)
+
+    orig_bgr : original image  (H,W,3) BGR
+    seg_map  : class ID map    (H,W)
+    plan     : output of plan_path()
     """
-    if not images:
-        return None
-    
-    # Ensure all images have same height
-    max_height = max(img.shape[0] for img in images)
-    resized_images = []
-    
-    for img in images:
-        if img.shape[0] != max_height:
-            aspect = img.shape[1] / img.shape[0]
-            new_width = int(max_height * aspect)
-            img = cv2.resize(img, (new_width, max_height))
-        resized_images.append(img)
-    
-    # Add labels if provided
-    if labels:
-        labeled_images = []
-        for img, label in zip(resized_images, labels):
-            img_copy = img.copy()
-            cv2.putText(img_copy, label, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            labeled_images.append(img_copy)
-        resized_images = labeled_images
-    
-    # Add borders
-    if border_width > 0:
-        bordered_images = []
-        for img in resized_images:
-            bordered = cv2.copyMakeBorder(
-                img, 0, 0, border_width, 0,
-                cv2.BORDER_CONSTANT, value=(255, 255, 255)
-            )
-            bordered_images.append(bordered)
-        resized_images = bordered_images[:-1] + [resized_images[-1]]  # Remove border from last image
-    
-    # Concatenate horizontally
-    combined = np.hstack(resized_images)
-    
-    return combined
+    from segmentation import TRAVERSAL_COST
+
+    h, w = orig_bgr.shape[:2]
+    canvas = orig_bgr.copy().astype(np.float32)
+
+    # ── Blend segmentation colour ──────────────────────────────────
+    seg_rgb = PALETTE[seg_map.ravel()].reshape(h, w, 3).astype(np.float32)
+    seg_bgr = seg_rgb[:, :, ::-1]
+    canvas  = cv2.addWeighted(canvas, 1.0 - seg_alpha, seg_bgr, seg_alpha, 0)
+    canvas  = canvas.astype(np.uint8)
+
+    # ── Red tint on hard obstacles ─────────────────────────────────
+    obstacle_mask = np.zeros((h, w), dtype=bool)
+    for cls, cost in TRAVERSAL_COST.items():
+        if cost == 2:
+            obstacle_mask[seg_map == cls] = True
+    overlay = canvas.copy()
+    overlay[obstacle_mask] = (overlay[obstacle_mask].astype(np.int32)
+                               + np.array([0, 0, 60], dtype=np.int32)).clip(0, 255).astype(np.uint8)
+    canvas = overlay
+
+    # ── Draw path ──────────────────────────────────────────────────
+    path = plan.get("path", [])
+    if path:
+        pts = np.array([(c, r) for r, c in path], dtype=np.int32)   # (x, y)
+        cv2.polylines(canvas, [pts.reshape(-1, 1, 2)], False,
+                      (0, 255, 0), thickness=4, lineType=cv2.LINE_AA)
+        # Waypoint dots every N points
+        step = max(1, len(pts) // 20)
+        for pt in pts[::step]:
+            cv2.circle(canvas, tuple(pt), 4, (0, 220, 0), -1)
+
+    # ── Start marker (blue filled circle) ─────────────────────────
+    sr, sc = plan["start"]
+    cv2.circle(canvas, (sc, sr), 14, (200, 80, 0),  -1)
+    cv2.circle(canvas, (sc, sr), 14, (255, 255, 255), 2)
+    cv2.putText(canvas, "S", (sc - 6, sr + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    # ── Goal marker (yellow filled circle) ────────────────────────
+    gr, gc = plan["goal"]
+    cv2.circle(canvas, (gc, gr), 14, (0, 200, 200),  -1)
+    cv2.circle(canvas, (gc, gr), 14, (255, 255, 255), 2)
+    cv2.putText(canvas, "G", (gc - 6, gr + 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    if not plan["found"]:
+        cv2.putText(canvas, "NO PATH FOUND", (w // 4, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+
+    return canvas
 
 
-def visualize_obstacle_grid(obstacle_grid):
+def make_legend() -> np.ndarray:
+    """Return a (H, W, 3) BGR legend image for all 10 classes."""
+    cell_h, cell_w = 28, 180
+    img = np.ones((cell_h * NUM_CLASSES, cell_w, 3), dtype=np.uint8) * 245
+
+    for i, (name, color) in enumerate(zip(CLASS_NAMES, PALETTE)):
+        y = i * cell_h
+        bgr = color[::-1].tolist()
+        cv2.rectangle(img, (4, y + 4), (26, y + cell_h - 4), bgr, -1)
+        cv2.rectangle(img, (4, y + 4), (26, y + cell_h - 4), (80, 80, 80), 1)
+        cv2.putText(img, name, (32, y + cell_h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (30, 30, 30), 1)
+    return img
+
+
+# ── Compatibility API used by app.py and test_integration.py ─────────
+
+def overlay_segmentation(image: np.ndarray,
+                          colored_mask: np.ndarray,
+                          alpha: float = 0.5) -> np.ndarray:
     """
-    Visualize obstacle grid as binary image
-    
-    Args:
-        obstacle_grid: Binary grid (1=obstacle, 0=navigable)
-        
-    Returns:
-        RGB visualization
+    Blend original image with segmentation colour mask.
+
+    image        : BGR image (H, W, 3)
+    colored_mask : RGB colored mask (H, W, 3) from model_inference.colorize()
+    alpha        : weight of the mask layer (0=all image, 1=all mask)
+    Returns BGR blended image.
     """
-    height, width = obstacle_grid.shape
-    vis = np.zeros((height, width, 3), dtype=np.uint8)
-    
-    # Navigable areas: Light gray
-    vis[obstacle_grid == 0] = [200, 200, 200]
-    
-    # Obstacles: Dark red
-    vis[obstacle_grid == 1] = [0, 0, 128]
-    
+    # colored_mask may be RGB (from model_inference), convert to BGR
+    if colored_mask.shape[2] == 3:
+        mask_bgr = cv2.cvtColor(colored_mask, cv2.COLOR_RGB2BGR)
+    else:
+        mask_bgr = colored_mask
+
+    # Resize mask to match image if needed
+    if image.shape[:2] != mask_bgr.shape[:2]:
+        mask_bgr = cv2.resize(mask_bgr, (image.shape[1], image.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+
+    return cv2.addWeighted(image, 1.0 - alpha, mask_bgr, alpha, 0)
+
+
+def draw_path_on_image(image: np.ndarray,
+                       path,
+                       color=(0, 255, 0),
+                       thickness: int = 3) -> np.ndarray:
+    """
+    Draw a path (list of (x,y) points) on a BGR image.
+    Returns a copy with the path drawn.
+    """
+    out = image.copy()
+    if path is None or len(path) == 0:
+        return out
+    pts = np.array(path, dtype=np.int32)
+    cv2.polylines(out, [pts.reshape(-1, 1, 2)], False,
+                  color, thickness=thickness, lineType=cv2.LINE_AA)
+    return out
+
+
+def visualize_obstacle_grid(obstacle_grid: np.ndarray) -> np.ndarray:
+    """
+    Convert binary obstacle grid (0=navigable, 1=obstacle) to a BGR image.
+    Green = navigable, Red = obstacle.
+    """
+    h, w = obstacle_grid.shape
+    vis = np.zeros((h, w, 3), dtype=np.uint8)
+    vis[obstacle_grid == 0] = (0, 200, 0)    # navigable — green
+    vis[obstacle_grid == 1] = (0, 0, 200)    # obstacle  — red
     return vis
 
 
-def draw_path_on_image(image, path, start_pos=None, goal_pos=None, 
-                       path_color=(0, 255, 0), path_thickness=3):
+def create_comparison_grid(images: list, labels: list = None) -> np.ndarray:
     """
-    Draw navigation path on image with start and goal markers
-    
-    Args:
-        image: Original BGR image
-        path: List of path coordinates [(row, col), ...]
-        start_pos: Start position (col, row) for marker
-        goal_pos: Goal position (col, row) for marker
-        path_color: RGB color for path line
-        path_thickness: Thickness of path line
-        
-    Returns:
-        Image with path overlay
-    """
-    result = image.copy()
-    
-    if path is not None and len(path) > 1:
-        # Convert path from (row, col) to (col, row) for drawing
-        path_points = [(p[1], p[0]) for p in path]
-        
-        # Draw path line
-        for i in range(len(path_points) - 1):
-            cv2.line(result, path_points[i], path_points[i + 1], 
-                    path_color, path_thickness)
-        
-        # Draw path as semi-transparent overlay
-        overlay = result.copy()
-        for point in path_points:
-            cv2.circle(overlay, point, path_thickness, path_color, -1)
-        result = cv2.addWeighted(result, 0.7, overlay, 0.3, 0)
-    
-    # Draw start marker
-    if start_pos is not None:
-        cv2.circle(result, start_pos, 12, (255, 0, 0), -1)  # Blue circle
-        cv2.circle(result, start_pos, 12, (255, 255, 255), 2)  # White border
-        cv2.putText(result, "START", (start_pos[0] - 35, start_pos[1] + 35),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(result, "START", (start_pos[0] - 35, start_pos[1] + 35),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 1, cv2.LINE_AA)
-    
-    # Draw goal marker
-    if goal_pos is not None:
-        cv2.circle(result, goal_pos, 12, (0, 0, 255), -1)  # Red circle
-        cv2.circle(result, goal_pos, 12, (255, 255, 255), 2)  # White border
-        cv2.putText(result, "GOAL", (goal_pos[0] - 30, goal_pos[1] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(result, "GOAL", (goal_pos[0] - 30, goal_pos[1] - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 1, cv2.LINE_AA)
-    
-    return result
-
-
-def create_comparison_grid(images, titles=None, grid_cols=2):
-    """
-    Create a grid layout of multiple images for comparison
-    
-    Args:
-        images: List of images (BGR format)
-        titles: Optional list of titles for each image
-        grid_cols: Number of columns in grid
-        
-    Returns:
-        Combined grid image
+    Stack a list of BGR images side-by-side into one wide image.
+    Optionally add text labels at the top of each panel.
+    All images are resized to the same height as the first image.
     """
     if not images:
-        return None
-    
-    n_images = len(images)
-    grid_rows = (n_images + grid_cols - 1) // grid_cols
-    
-    # Find max dimensions
-    max_height = max(img.shape[0] for img in images)
-    max_width = max(img.shape[1] for img in images)
-    
-    # Create grid
-    grid = []
-    for row in range(grid_rows):
-        row_images = []
-        for col in range(grid_cols):
-            idx = row * grid_cols + col
-            if idx < n_images:
-                img = images[idx].copy()
-                
-                # Resize to match dimensions
-                if img.shape[0] != max_height or img.shape[1] != max_width:
-                    img = cv2.resize(img, (max_width, max_height))
-                
-                # Add title if provided
-                if titles and idx < len(titles):
-                    cv2.rectangle(img, (0, 0), (max_width, 40), (0, 0, 0), -1)
-                    cv2.putText(img, titles[idx], (10, 28),
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                
-                row_images.append(img)
-            else:
-                # Fill with black if grid not complete
-                row_images.append(np.zeros((max_height, max_width, 3), dtype=np.uint8))
-        
-        grid.append(np.hstack(row_images))
-    
-    return np.vstack(grid)
+        return np.zeros((100, 100, 3), dtype=np.uint8)
 
-
-def add_legend(image, class_names, colors, position='right'):
-    """
-    Add color legend to image
-    
-    Args:
-        image: Input BGR image
-        class_names: List of class names
-        colors: List of RGB colors corresponding to classes
-        position: Position of legend ('right', 'bottom')
-        
-    Returns:
-        Image with legend
-    """
-    img_copy = image.copy()
-    height, width = img_copy.shape[:2]
-    
-    if position == 'right':
-        # Create legend panel
-        legend_width = 200
-        legend = np.ones((height, legend_width, 3), dtype=np.uint8) * 255
-        
-        # Add legend items
-        y_offset = 50
-        for i, (name, color) in enumerate(zip(class_names, colors)):
-            if y_offset + 30 < height:
-                # Draw color box
-                cv2.rectangle(legend, (20, y_offset), (50, y_offset + 20), 
-                            color.tolist(), -1)
-                cv2.rectangle(legend, (20, y_offset), (50, y_offset + 20), 
-                            (0, 0, 0), 1)
-                
-                # Draw text
-                cv2.putText(legend, name, (60, y_offset + 15),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-                
-                y_offset += 30
-        
-        # Add title
-        cv2.putText(legend, "Legend", (20, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        
-        # Concatenate
-        result = np.hstack([img_copy, legend])
-    
-    else:  # bottom
-        # Create legend panel
-        legend_height = 100
-        legend = np.ones((legend_height, width, 3), dtype=np.uint8) * 255
-        
-        # Add legend items horizontally
-        x_offset = 20
-        for name, color in zip(class_names, colors):
-            if x_offset + 150 < width:
-                # Draw color box
-                cv2.rectangle(legend, (x_offset, 30), (x_offset + 30, 50), 
-                            color.tolist(), -1)
-                cv2.rectangle(legend, (x_offset, 30), (x_offset + 30, 50), 
-                            (0, 0, 0), 1)
-                
-                # Draw text
-                cv2.putText(legend, name, (x_offset + 35, 45),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-                
-                x_offset += 150
-        
-        # Concatenate
-        result = np.vstack([img_copy, legend])
-    
-    return result
-
-
-def add_legend(image, class_names, colors, position='right'):
-    """
-    Add color legend to image
-    
-    Args:
-        image: Input BGR image
-        class_names: List of class names
-        colors: List of RGB colors
-        position: 'right' or 'bottom'
-        
-    Returns:
-        Image with legend
-    """
-    img = image.copy()
-    height, width = img.shape[:2]
-    
-    box_size = 20
-    text_offset = 30
-    padding = 10
-    
-    if position == 'right':
-        legend_width = 200
-        legend = np.ones((height, legend_width, 3), dtype=np.uint8) * 255
-        
-        y_start = 20
-        for i, (name, color) in enumerate(zip(class_names, colors)):
-            y = y_start + i * (box_size + padding)
-            if y + box_size > height:
-                break
-            
-            # Draw color box (convert RGB to BGR for cv2)
-            cv2.rectangle(legend, (10, y), (10 + box_size, y + box_size),
-                         (int(color[2]), int(color[1]), int(color[0])), -1)
-            
-            # Draw text
-            cv2.putText(legend, name, (10 + text_offset, y + 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-        
-        # Combine with image
-        combined = np.hstack([img, legend])
-    else:
-        # Bottom legend
-        legend_height = 100
-        legend = np.ones((legend_height, width, 3), dtype=np.uint8) * 255
-        
-        x_start = 20
-        for i, (name, color) in enumerate(zip(class_names, colors)):
-            x = x_start + i * 150
-            if x + box_size > width:
-                break
-            
-            # Draw color box
-            cv2.rectangle(legend, (x, 20), (x + box_size, 20 + box_size),
-                         (int(color[2]), int(color[1]), int(color[0])), -1)
-            
-            # Draw text
-            cv2.putText(legend, name, (x + text_offset, 35),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-        
-        # Combine with image
-        combined = np.vstack([img, legend])
-    
-    return combined
+    target_h = images[0].shape[0]
+    panels = []
+    for i, img in enumerate(images):
+        # Resize to same height
+        if img.shape[0] != target_h:
+            scale = target_h / img.shape[0]
+            img = cv2.resize(img, (int(img.shape[1] * scale), target_h))
+        panel = img.copy()
+        if labels and i < len(labels):
+            cv2.putText(panel, labels[i], (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(panel, labels[i], (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+        panels.append(panel)
+    return np.concatenate(panels, axis=1)
