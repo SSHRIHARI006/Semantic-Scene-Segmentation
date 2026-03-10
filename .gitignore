@@ -16,3 +16,4 @@ segmentation_head.pth
 predictions
 segmentation_head.pth
 feature_cache
+segmentation_head.pth
